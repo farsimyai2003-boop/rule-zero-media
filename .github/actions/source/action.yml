@@ -15,12 +15,14 @@ runs:
       env:
         SOURCE_KEY: ${{ inputs.source-key }}
         SOURCE_REF: ${{ inputs.source-ref }}
+        GH_READ_TOKEN: ${{ github.token }}
       run: |
         python - <<'PY'
         import json,os,pathlib,subprocess,urllib.request
         tmp=pathlib.Path(os.environ['RUNNER_TEMP'])
         key=tmp/'rule-zero-source-key';key.write_text(os.environ['SOURCE_KEY']);key.chmod(0o600)
-        with urllib.request.urlopen('https://api.github.com/meta',timeout=30) as r:meta=json.load(r)
+        request=urllib.request.Request('https://api.github.com/meta',headers={'Authorization':'Bearer '+os.environ['GH_READ_TOKEN'],'User-Agent':'RULE-ZERO-cloud'})
+        with urllib.request.urlopen(request,timeout=30) as r:meta=json.load(r)
         hosts=tmp/'rule-zero-known-hosts'
         hosts.write_text('\n'.join('github.com '+k for k in meta['ssh_keys'])+'\n')
         command=f'ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={hosts}'

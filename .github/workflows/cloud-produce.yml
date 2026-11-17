@@ -101,7 +101,7 @@ jobs:
           EPISODE: ${{ steps.plan.outputs.episode }}
         run: python tools/cloud/pipeline.py voice-ready --episode "$EPISODE" >> "$RUNNER_TEMP/private-produce.log" 2>&1
       - name: Retain resumable private checkpoint on failure
-        if: failure()
+        if: failure() && env.RZ_SOURCE_ROOT != ''
         working-directory: private-source
         run: |
           EPISODE=$(python -c "import json;print(json.load(open('state.json'))['next'])")
