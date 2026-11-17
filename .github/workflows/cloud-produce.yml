@@ -1,5 +1,7 @@
 name: RULE ZERO cloud studio
 on:
+  schedule:
+    - cron: '17 6,12 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
