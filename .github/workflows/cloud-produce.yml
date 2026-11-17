@@ -1,0 +1,241 @@
+name: RULE ZERO cloud studio
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Verify connections, produce a checked preview, or publish the saved preview
+        type: choice
+        options: [verify, produce, publish-ready]
+        default: verify
+      publish:
+        description: Schedule a checked episode automatically
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: rule-zero-studio
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: inputs.mode == 'verify'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/source
+        with:
+          source-key: ${{ secrets.RZ_SOURCE_SSH_KEY }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install cryptography==50.0.2 pynacl==1.6.2
+      - name: Verify private connections without public output
+        working-directory: private-source
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          RZ_OAUTH_KEY: ${{ secrets.RZ_OAUTH_KEY }}
+        run: |
+          python tools/cloud/preflight.py > "$RUNNER_TEMP/private-preflight.log" 2>&1
+          echo 'Free writer and intended YouTube brand verified.'
+  prepare:
+    if: inputs.mode == 'produce' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      episode: ${{ steps.plan.outputs.episode }}
+      source_sha: ${{ steps.ready.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/source
+        with:
+          source-key: ${{ secrets.RZ_SOURCE_SSH_KEY }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install uv cryptography==50.0.2 pynacl==1.6.2
+      - name: Plan and review story privately
+        id: plan
+        working-directory: private-source
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          RZ_OAUTH_KEY: ${{ secrets.RZ_OAUTH_KEY }}
+        run: python tools/cloud/pipeline.py plan > "$RUNNER_TEMP/private-produce.log" 2>&1
+      - name: Build Patrick with the established voice
+        if: steps.plan.outputs.build == 'true'
+        working-directory: private-source
+        env:
+          EPISODE: ${{ steps.plan.outputs.episode }}
+          HF_HOME: ${{ runner.temp }}/omni-models
+        run: |
+          uv venv .venv-omni
+          uv pip install --python .venv-omni/bin/python torch==2.8.0+cpu torchaudio==2.8.0+cpu --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python .venv-omni/bin/python omnivoice==0.2.1 soundfile
+          .venv-omni/bin/python tools/cloud/prepare_patrick.py "episodes/$EPISODE" >> "$RUNNER_TEMP/private-produce.log" 2>&1
+          rm -rf -- "$RUNNER_TEMP/omni-models" "$GITHUB_WORKSPACE/private-source/.venv-omni"
+          uv cache clean
+      - name: Build and verify narrator speech
+        if: steps.plan.outputs.build == 'true'
+        working-directory: private-source
+        env:
+          EPISODE: ${{ steps.plan.outputs.episode }}
+          HF_HOME: ${{ runner.temp }}/narrator-models
+          RZ_PREBUILT_PATRICK: '1'
+          RZ_WHISPER: base.en
+          OMP_NUM_THREADS: '4'
+        run: |
+          uv venv .venv-tts
+          uv pip install --python .venv-tts/bin/python torch==2.6.0+cpu torchaudio==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python .venv-tts/bin/python chatterbox-tts==0.1.7 'setuptools<81' faster-whisper==1.2.1 soundfile kokoro-onnx
+          .venv-tts/bin/python tools/build_voice.py "episodes/$EPISODE" >> "$RUNNER_TEMP/private-produce.log" 2>&1
+      - name: Save exact voice and timeline
+        id: ready
+        if: steps.plan.outputs.build == 'true'
+        working-directory: private-source
+        env:
+          EPISODE: ${{ steps.plan.outputs.episode }}
+        run: python tools/cloud/pipeline.py voice-ready --episode "$EPISODE" >> "$RUNNER_TEMP/private-produce.log" 2>&1
+      - name: Retain resumable private checkpoint on failure
+        if: failure()
+        working-directory: private-source
+        run: |
+          EPISODE=$(python -c "import json;print(json.load(open('state.json'))['next'])")
+          mkdir -p "episodes/$EPISODE"
+          tail -c 6000 "$RUNNER_TEMP/private-produce.log" > "episodes/$EPISODE/cloud-failure.log" || true
+          python tools/cloud/pipeline.py checkpoint --episode "$EPISODE" > /dev/null 2>&1 || true
+          echo 'Production stopped. Diagnostic details are saved only in the private source repository.'
+  render:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        segment: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/source
+        with:
+          source-key: ${{ secrets.RZ_SOURCE_SSH_KEY }}
+          source-ref: ${{ needs.prepare.outputs.source_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile scene engine
+        working-directory: private-source
+        run: |
+          pip install cryptography==50.0.2
+          npm ci --prefix engine > "$RUNNER_TEMP/private-render.log" 2>&1
+          node engine/node_modules/typescript/bin/tsc --noEmit --project engine >> "$RUNNER_TEMP/private-render.log" 2>&1
+      - name: Render and encrypt segment
+        working-directory: private-source
+        env:
+          EPISODE: ${{ needs.prepare.outputs.episode }}
+          SEGMENT: ${{ matrix.segment }}
+          RZ_ARTIFACT_KEY: ${{ secrets.RZ_ARTIFACT_KEY }}
+        run: |
+          python tools/cloud/render_chunk.py "$EPISODE" "$SEGMENT" >> "$RUNNER_TEMP/private-render.log" 2>&1
+          python tools/cloud/artifacts.py encrypt "out/chunks/$SEGMENT.mp4" "out/encrypted/$SEGMENT.enc"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-segment-${{ matrix.segment }}-${{ github.run_id }}
+          path: private-source/out/encrypted/
+          retention-days: 1
+  finish:
+    needs: [prepare, render]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/source
+        with:
+          source-key: ${{ secrets.RZ_SOURCE_SSH_KEY }}
+          source-ref: ${{ needs.prepare.outputs.source_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: encrypted-segment-*-${{ github.run_id }}
+          path: private-source/out/encrypted/
+          merge-multiple: true
+      - name: Install mastering and QA dependencies
+        working-directory: private-source
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          pip install numpy==2.4.6 scipy==1.16.3 soundfile==0.14.0 imageio-ffmpeg==0.8.1 Pillow==13.0.0 faster-whisper==1.2.1 cryptography==50.0.2 pynacl==1.6.2
+          npm ci --prefix engine > "$RUNNER_TEMP/private-finish.log" 2>&1
+      - name: Assemble, grade and mix
+        working-directory: private-source
+        env:
+          EPISODE: ${{ needs.prepare.outputs.episode }}
+          RZ_ARTIFACT_KEY: ${{ secrets.RZ_ARTIFACT_KEY }}
+        run: |
+          for i in {0..7}; do python tools/cloud/artifacts.py decrypt "out/encrypted/$i.enc" "out/chunks/$i.mp4"; done
+          python tools/cloud/pipeline.py assemble --episode "$EPISODE" >> "$RUNNER_TEMP/private-finish.log" 2>&1
+      - name: Check actual picture, speech and story evidence
+        working-directory: private-source
+        env:
+          EPISODE: ${{ needs.prepare.outputs.episode }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python tools/cloud/pipeline.py quality --episode "$EPISODE" >> "$RUNNER_TEMP/private-finish.log" 2>&1
+      - name: Save approved media and optionally schedule
+        working-directory: private-source
+        env:
+          EPISODE: ${{ needs.prepare.outputs.episode }}
+          RZ_OAUTH_KEY: ${{ secrets.RZ_OAUTH_KEY }}
+          SHOULD_PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+        run: |
+          ARGS=()
+          if [ "$SHOULD_PUBLISH" = true ]; then ARGS+=(--publish); fi
+          python tools/cloud/pipeline.py publish --episode "$EPISODE" "${ARGS[@]}" >> "$RUNNER_TEMP/private-finish.log" 2>&1
+          echo 'Checked episode saved. See the private source state for its release status.'
+      - name: Preserve QA evidence privately
+        if: always()
+        working-directory: private-source
+        env:
+          EPISODE: ${{ needs.prepare.outputs.episode }}
+        run: |
+          mkdir -p "episodes/$EPISODE/cloud-review"
+          cp out/quality/"$EPISODE"/*.jpg "episodes/$EPISODE/cloud-review/" 2>/dev/null || true
+          tail -c 6000 "$RUNNER_TEMP/private-finish.log" > "episodes/$EPISODE/cloud-finish.log" || true
+          python tools/cloud/pipeline.py checkpoint --episode "$EPISODE" > /dev/null 2>&1 || true
+  publish_ready:
+    if: inputs.mode == 'publish-ready' && inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/source
+        with:
+          source-key: ${{ secrets.RZ_SOURCE_SSH_KEY }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install cryptography==50.0.2 pynacl==1.6.2
+      - working-directory: private-source
+        env:
+          RZ_OAUTH_KEY: ${{ secrets.RZ_OAUTH_KEY }}
+        run: |
+          EPISODE=$(python -c "import json;print(json.load(open('state.json'))['next'])")
+          python tools/cloud/pipeline.py publish --episode "$EPISODE" --publish > "$RUNNER_TEMP/private-publish.log" 2>&1
+          echo 'Saved preview scheduled and verified.'

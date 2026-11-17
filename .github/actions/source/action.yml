@@ -1,0 +1,35 @@
+name: Load private RULE ZERO source
+description: Load private production code without exposing it in public artifacts
+inputs:
+  source-key:
+    required: true
+    description: Repository-scoped SSH deploy key
+  source-ref:
+    required: false
+    default: main
+    description: Exact source commit or main
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SOURCE_KEY: ${{ inputs.source-key }}
+        SOURCE_REF: ${{ inputs.source-ref }}
+      run: |
+        python - <<'PY'
+        import json,os,pathlib,subprocess,urllib.request
+        tmp=pathlib.Path(os.environ['RUNNER_TEMP'])
+        key=tmp/'rule-zero-source-key';key.write_text(os.environ['SOURCE_KEY']);key.chmod(0o600)
+        with urllib.request.urlopen('https://api.github.com/meta',timeout=30) as r:meta=json.load(r)
+        hosts=tmp/'rule-zero-known-hosts'
+        hosts.write_text('\n'.join('github.com '+k for k in meta['ssh_keys'])+'\n')
+        command=f'ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={hosts}'
+        env={**os.environ,'GIT_SSH_COMMAND':command}
+        root=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'private-source'
+        subprocess.run(['git','clone','--quiet','--depth','1','git@github.com:farsimyai2003-boop/rule-zero.git',str(root)],env=env,check=True)
+        if os.environ['SOURCE_REF']!='main':
+          subprocess.run(['git','fetch','--quiet','--depth','1','origin',os.environ['SOURCE_REF']],cwd=root,env=env,check=True)
+          subprocess.run(['git','checkout','--quiet','FETCH_HEAD'],cwd=root,env=env,check=True)
+        with open(os.environ['GITHUB_ENV'],'a') as f:
+          f.write(f'GIT_SSH_COMMAND={command}\nRZ_SOURCE_ROOT={root}\nRZ_AUTH_GIT=1\nRZ_MEDIA_ROOT={os.environ["GITHUB_WORKSPACE"]}\n')
+        PY
