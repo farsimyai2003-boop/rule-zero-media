@@ -65,7 +65,11 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           RZ_OAUTH_KEY: ${{ secrets.RZ_OAUTH_KEY }}
-        run: python tools/cloud/pipeline.py plan > "$RUNNER_TEMP/private-produce.log" 2>&1
+          SHOULD_PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+        run: |
+          ARGS=()
+          if [ "$SHOULD_PUBLISH" = true ]; then ARGS+=(--publish); fi
+          python tools/cloud/pipeline.py plan "${ARGS[@]}" > "$RUNNER_TEMP/private-produce.log" 2>&1
       - name: Build Patrick with the established voice
         if: steps.plan.outputs.build == 'true'
         working-directory: private-source
@@ -152,6 +156,12 @@ jobs:
           name: encrypted-segment-${{ matrix.segment }}-${{ github.run_id }}
           path: private-source/out/encrypted/
           retention-days: 1
+      - name: Preserve failed render diagnostic privately
+        if: failure() && env.RZ_SOURCE_ROOT != ''
+        working-directory: private-source
+        env:
+          RZ_SEGMENT: ${{ matrix.segment }}
+        run: python tools/cloud/save_diagnostic.py "$RUNNER_TEMP/private-render.log" > /dev/null 2>&1
   finish:
     needs: [prepare, render]
     runs-on: ubuntu-24.04
@@ -239,3 +249,7 @@ jobs:
           EPISODE=$(python -c "import json;print(json.load(open('state.json'))['next'])")
           python tools/cloud/pipeline.py publish --episode "$EPISODE" --publish > "$RUNNER_TEMP/private-publish.log" 2>&1
           echo 'Saved preview scheduled and verified.'
+      - name: Preserve failed scheduling diagnostic privately
+        if: failure() && env.RZ_SOURCE_ROOT != ''
+        working-directory: private-source
+        run: python tools/cloud/save_diagnostic.py "$RUNNER_TEMP/private-publish.log" > /dev/null 2>&1
